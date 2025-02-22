@@ -2,113 +2,167 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.IdentityModel.Tokens;
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text;
 
-namespace RotatingJwt
+namespace SecureJwt
 {
-    public class JwtTokenService
+    /// <summary>
+    /// Service for generating and validating JWT tokens with fingerprinting.
+    /// </summary>
+    /// <remarks>
+    /// Initializes a new instance of the <see cref="JwtTokenService"/> class.
+    /// </remarks>
+    /// <param name="memoryCache">The memory cache instance.</param>
+    /// <param name="httpContextAccessor">The HTTP context accessor.</param>
+    public class JwtTokenService(IMemoryCache memoryCache, IHttpContextAccessor httpContextAccessor)
     {
-        private readonly IMemoryCache _memoryCache;
-        private readonly IHttpContextAccessor _httpContextAccessor;
-        public JwtTokenService(IMemoryCache memoryCache, IHttpContextAccessor httpContextAccessor)
+        private readonly IMemoryCache _memoryCache = memoryCache;
+        private readonly IHttpContextAccessor _httpContextAccessor = httpContextAccessor;
+
+        /// <summary>
+        /// Generates an access token for the given user ID.
+        /// </summary>
+        /// <param name="userId">The user ID to encode into the token.</param>
+        /// <param name="claims">The user ID to encode into the token.</param>
+        /// <returns>A <see cref="TokenResponse"/> containing the generated token and keys.</returns>
+        public TokenResponse GenerateJwtToken(string userId, List<Claim> claims = null)
         {
-            _memoryCache = memoryCache;
-            _httpContextAccessor = httpContextAccessor;
+            using var rsa = new RSACryptoServiceProvider(4096);
+            return GenerateJwtToken(userId, rsa, claims);
         }
-        public TokenResponse GenerateAccessToken(string userId)
+
+        /// <summary>
+        /// Generates an access token for the given user ID.
+        /// </summary>
+        /// <param name="userId">The user ID to encode into the token.</param>
+        /// <param name="claims">The claims, user should have in the generated token.</param>
+        /// <param name="rsaKey">The RSA Key Service Provider, which will create key to be used for signing the token.</param>
+        /// <returns>A <see cref="TokenResponse"/> containing the generated token and keys.</returns>
+        public TokenResponse GenerateJwtToken(string userId, RSACryptoServiceProvider rsaKey, List<Claim> claims = null)
         {
-            userId = userId.Encrypt(ServiceExtension.JwtOptions.SecretKey);
-            using (var rsa = new RSACryptoServiceProvider(4096))
+            userId = userId.Encrypt(ServiceExtension.JwtOptions.Config.SecretKey);
+            // Export private and public keys
+            var privateKeyXml = rsaKey.ToXmlString(true);
+            var publicKeyXml = rsaKey.ToXmlString(false);
+
+            var key = new RsaSecurityKey(rsaKey);
+            var credentials = new SigningCredentials(key, SecurityAlgorithms.RsaSha256);
+
+            // Generate fingerprint from request headers
+            var fingerprint = GenerateFingerprint();
+
+            // Add userId and fingerprint to claims
+            claims ??= [];
+
+            claims.AddRange([
+                new Claim(ClaimTypes.Authentication, userId),
+                new Claim("fingerprint", fingerprint) // Custom claim for fingerprint
+            ]);
+
+            var token = new JwtSecurityToken(
+                issuer: ServiceExtension.JwtOptions.Config.Issuer,
+                audience: ServiceExtension.JwtOptions.Config.Audience,
+                claims: claims,
+                expires: DateTime.UtcNow.Add(ServiceExtension.JwtOptions.Config.TokenLifeTime),
+                signingCredentials: credentials
+            );
+
+            var response = new TokenResponse
             {
-                // Export private and public keys as XML strings
-                var privateKeyXml = rsa.ToXmlString(true); // Contains private + public key
-                var publicKeyXml = rsa.ToXmlString(false); // Only public key
+                PublicKey = publicKeyXml.Encrypt(ServiceExtension.JwtOptions.Config.SecretKey),
+                Token = new JwtSecurityTokenHandler().WriteToken(token)
+            };
 
-                var key = new RsaSecurityKey(rsa);
-                var credentials = new SigningCredentials(key, SecurityAlgorithms.RsaSha256);
-                if (!ServiceExtension.JwtOptions.Claims.Exists(x => x.Type == ClaimTypes.Authentication))
-                {
-                    ServiceExtension.JwtOptions.Claims.Add(new Claim(ClaimTypes.Authentication, userId));
-                }
-                else
-                {
-                    var index = ServiceExtension.JwtOptions.Claims.FindIndex(x => x.Type == ClaimTypes.Authentication);
-                    ServiceExtension.JwtOptions.Claims[index] = new Claim(ClaimTypes.Authentication, userId);
-                }
-
-                var token = new JwtSecurityToken(
-                    issuer: ServiceExtension.JwtOptions.Issuer,
-                    audience: ServiceExtension.JwtOptions.Audience,
-                    claims: ServiceExtension.JwtOptions.Claims,
-                    expires: DateTime.UtcNow.Add(ServiceExtension.JwtOptions.TokenLifeTime),
-                    signingCredentials: credentials
-                );
-
-
-
-                var response = new TokenResponse
-                {
-                    PrivateKey = privateKeyXml.Encrypt(ServiceExtension.JwtOptions.SecretKey),
-                    PublicKey = publicKeyXml.Encrypt(ServiceExtension.JwtOptions.SecretKey),
-                    Token = new JwtSecurityTokenHandler().WriteToken(token)
-                };
-
-                _memoryCache.Set(userId, response, ServiceExtension.JwtOptions.TokenLifeTime);
-                return response;
-            }
+            // Store token response in memory cache along with fingerprint
+            _memoryCache.Set(userId, new { response, fingerprint }, ServiceExtension.JwtOptions.Config.TokenLifeTime);
+            return response;
         }
 
-        public TokenValidationParameters ValidateParameters()
+        /// <summary>
+        /// Validates the token extracted from the HTTP request.
+        /// </summary>
+        /// <returns>A <see cref="TokenValidationResult"/> representing the validation outcome.</returns>
+        public TokenValidationResult VerifyToken()
         {
             var token = _httpContextAccessor.HttpContext?.Request.Headers["Authorization"].ToString()
                 .Replace("Bearer ", "") ?? "";
-            //?? throw new NullReferenceException("Unable to read the token");
-            return ValidateParameters(token);
+
+            return VerifyToken(token);
         }
 
-        public TokenValidationParameters ValidateParameters(string token)
+        /// <summary>
+        /// Validates a given JWT token.
+        /// </summary>
+        /// <param name="token">The JWT token to validate.</param>
+        /// <returns>A <see cref="TokenValidationResult"/> representing the validation outcome.</returns>
+        public TokenValidationResult VerifyToken(string token)
         {
             if (string.IsNullOrEmpty(token))
             {
-                return new TokenValidationParameters
-                {
-                    ValidateIssuer = true,
-                    ValidateAudience = true,
-                    ValidateLifetime = true,
-                    ValidateIssuerSigningKey = true
-                };
+                return new TokenValidationResult { IsValid = false, Error = "Token is missing" };
             }
-            using (var rsa = new RSACryptoServiceProvider(4096))
+
+            using var rsa = new RSACryptoServiceProvider(4096);
+            var handler = new JwtSecurityTokenHandler();
+
+            // Read and parse the token
+            var jwtToken = handler.ReadJwtToken(token);
+
+            // Extract claims
+            var userId = jwtToken.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Authentication)?.Value;
+            var tokenFingerprint = jwtToken.Claims.FirstOrDefault(c => c.Type == "fingerprint")?.Value;
+
+            if (!_memoryCache.TryGetValue(userId, out var cachedTokenObj))
             {
-                var handler = new JwtSecurityTokenHandler();
-
-                // Read and parse the token
-                var jwtToken = handler.ReadJwtToken(token);
-
-                // Extract the claim value
-                var userId = jwtToken.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Authentication)?.Value;
-
-                var tokenResponse =
-                    _memoryCache.Get<TokenResponse>(userId ??
-                                                    throw new NullReferenceException("Authentication Claim is null"))
-                    ?? throw new NullReferenceException("Token Response not found or expired");
-
-                rsa.FromXmlString(tokenResponse.PublicKey.Decrypt(ServiceExtension.JwtOptions.SecretKey));
-
-                var key = new RsaSecurityKey(rsa);
-
-                return new TokenValidationParameters
-                {
-                    ValidateIssuer = true,
-                    ValidateAudience = true,
-                    ValidateLifetime = true,
-                    ValidateIssuerSigningKey = true,
-                    IssuerSigningKey = key
-                };
+                return new TokenValidationResult { IsValid = false, Error = "Invalid or expired token" };
             }
+
+            var cachedTokenData = (dynamic)cachedTokenObj;
+            var cachedFingerprint = cachedTokenData?.fingerprint;
+
+            // Compare fingerprint from token with request fingerprint
+            var requestFingerprint = GenerateFingerprint();
+            if (tokenFingerprint != requestFingerprint != cachedFingerprint)
+            {
+                return new TokenValidationResult
+                { IsValid = false, Error = "Fingerprint mismatch! Possible token reuse." };
+            }
+
+            if (cachedTokenData.response is not TokenResponse tokenResponse)
+            {
+                return new TokenValidationResult { IsValid = false, Error = "Invalid token data" };
+            }
+
+            rsa.FromXmlString(tokenResponse.PublicKey.Decrypt(ServiceExtension.JwtOptions.Config.SecretKey));
+            var key = new RsaSecurityKey(rsa);
+
+            var parameters = ServiceExtension.JwtOptions.TokenValidationParameters;
+
+            parameters.IssuerSigningKey = key;
+
+            var principal = handler.ValidateToken(token, parameters, out _);
+            return new TokenValidationResult { IsValid = true, ClaimsPrincipal = principal };
+        }
+
+        /// <summary>
+        /// Generates a fingerprint based on client request data.
+        /// </summary>
+        /// <returns>A Base64-encoded SHA256 hash representing the request fingerprint.</returns>
+        private string GenerateFingerprint()
+        {
+            var context = _httpContextAccessor.HttpContext;
+            var userAgent = context?.Request.Headers.UserAgent.FirstOrDefault() ?? "UnknownUA";
+            var acceptLang = context?.Request.Headers.AcceptLanguage.FirstOrDefault() ?? "UnknownLang";
+            var ipAddress = context?.Connection.RemoteIpAddress?.ToString() ?? "UnknownIP";
+            var rawData = $"{userAgent}-{acceptLang}-{ipAddress}";
+            var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(rawData));
+            return Convert.ToBase64String(hashBytes);
         }
     }
 }

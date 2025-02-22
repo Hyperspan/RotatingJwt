@@ -1,10 +1,6 @@
-
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.IdentityModel.Tokens;
-using RotatingJwt;
-using System.IdentityModel.Tokens.Jwt;
+﻿using Microsoft.OpenApi.Models;
+using SecureJwt;
 using System.Security.Cryptography;
-using Microsoft.OpenApi.Models;
 
 namespace Tests_Api
 {
@@ -51,114 +47,23 @@ namespace Tests_Api
                 });
             });
 
-            builder.Services.AddHttpContextAccessor();
-            builder.Services.AddRotatingJwt(options =>
+            builder.Services.AddSecureJwt(options =>
             {
-                options.TokenLifeTime = TimeSpan.FromMinutes(20);
-                options.RefreshTokenLifeTime = TimeSpan.FromMinutes(40);
-                options.AesKeySize = 256;
-                options.Audience = "http://localhost:5281";
-                options.Issuer = "http://localhost:5281";
+                options.Config = new RotatingJwtOptions
+                {
+                    TokenLifeTime = TimeSpan.FromMinutes(20),
+                    RefreshTokenLifeTime = TimeSpan.FromMinutes(40),
+                    AesKeySize = 256,
+                    Audience = "https://localhost:7054/",
+                    Issuer = "https://localhost:7054/",
+
+                };
                 using var aes = Aes.Create();
                 aes.KeySize = 256;
                 aes.GenerateKey();
-                options.SecretKey = Convert.ToBase64String(aes.Key);
+                options.Config.SecretKey = Convert.ToBase64String(aes.Key);
                 return options;
             });
-
-            builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-                .AddJwtBearer(options =>
-                {
-                    using (var rsa = new RSACryptoServiceProvider(2048))
-                    {
-                        options.TokenValidationParameters = new TokenValidationParameters
-                        {
-                            ValidateIssuer = false,  // Will be validated dynamically
-                            ValidateAudience = false,
-                            ValidateIssuerSigningKey = true,
-                            ValidateLifetime = false, // Will be validated dynamically
-                            IssuerSigningKey = new RsaSecurityKey(rsa) // Temporary dummy key
-                        };
-                    }
-                    options.Events = new JwtBearerEvents
-                    {
-                        OnMessageReceived = context =>
-                        {
-                            var token = context.Request.Headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
-                            if (!string.IsNullOrEmpty(token))
-                            {
-                                context.HttpContext.Items["JWT"] = token;
-                            }
-
-
-                            try
-                            {
-                                var serviceProvider = context.HttpContext.RequestServices;
-                                var jwtService = serviceProvider.GetRequiredService<JwtTokenService>();
-
-                                if (string.IsNullOrEmpty(token))
-                                {
-                                    context.Fail("JWT Token is missing.");
-                                    return Task.CompletedTask;
-                                }
-
-                                // ?? Dynamically fetch validation parameters
-                                var validationParameters = jwtService.ValidateParameters(token);
-                                var handler = new JwtSecurityTokenHandler();
-
-                                // ?? Revalidate token with updated parameters
-                                handler.ValidateToken(token, validationParameters, out _);
-                            }
-                            catch (SecurityTokenException ex)
-                            {
-                                context.Fail($"Token validation failed: {ex.Message}");
-                            }
-                            catch (Exception ex)
-                            {
-                                context.Fail($"Unexpected error: {ex.Message}");
-                            }
-                            return Task.CompletedTask;
-                        },
-                        OnAuthenticationFailed = context =>
-                        {
-                            Console.WriteLine($"Authentication Failed: {context.Exception.Message}");
-                            return Task.CompletedTask;
-                        },
-                        OnTokenValidated = async context =>
-                        {
-                            try
-                            {
-                                var serviceProvider = context.HttpContext.RequestServices;
-                                var jwtService = serviceProvider.GetRequiredService<JwtTokenService>();
-
-                                var token = context.HttpContext.Items["JWT"] as string;
-                                if (string.IsNullOrEmpty(token))
-                                {
-                                    context.Fail("JWT Token is missing.");
-                                    return;
-                                }
-
-                                // ?? Dynamically fetch validation parameters
-                                var validationParameters = jwtService.ValidateParameters(token);
-                                var handler = new JwtSecurityTokenHandler();
-
-                                // ?? Revalidate token with updated parameters
-                                handler.ValidateToken(token, validationParameters, out _);
-                            }
-                            catch (SecurityTokenException ex)
-                            {
-                                context.Fail($"Token validation failed: {ex.Message}");
-                            }
-                            catch (Exception ex)
-                            {
-                                context.Fail($"Unexpected error: {ex.Message}");
-                            }
-                        }
-                    };
-                });
-
-
-            builder.Services.AddAuthorization();
 
             var app = builder.Build();
 
@@ -170,10 +75,8 @@ namespace Tests_Api
             }
 
             app.UseHttpsRedirection();
-
             app.UseAuthentication();
             app.UseAuthorization();
-
             app.MapControllers();
 
             app.Run();

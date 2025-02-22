@@ -1,47 +1,65 @@
-﻿using Microsoft.AspNetCore.Http;
+﻿using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.IdentityModel.Tokens;
 using Serilog;
 using System;
-using System.Text;
 
-namespace RotatingJwt
+namespace SecureJwt
 {
+    /// <summary>
+    /// Provides extension methods for configuring JWT authentication services.
+    /// </summary>
     public static class ServiceExtension
     {
-        internal static RotatingJwtOptions JwtOptions { get; set; } = new RotatingJwtOptions
+        /// <summary>
+        /// Gets or sets the JWT options for configuring token properties.
+        /// </summary>
+        internal static JwtConfiguration JwtOptions { get; set; } = new()
         {
-            RefreshTokenLifeTime = TimeSpan.FromMinutes(40),
-            TokenLifeTime = TimeSpan.FromMinutes(20)
+            Config = new RotatingJwtOptions
+            {
+                RefreshTokenLifeTime = TimeSpan.FromMinutes(20),
+                TokenLifeTime = TimeSpan.FromMinutes(20)
+            },
+            TokenValidationParameters = new TokenValidationParameters()
         };
 
-        public static void AddRotatingJwt(this IServiceCollection services, Func<RotatingJwtOptions, RotatingJwtOptions> options)
-        {
-            JwtOptions = options.Invoke(new RotatingJwtOptions());
-
-            if (string.IsNullOrEmpty(JwtOptions.SecretKey))
-            {
-                throw new ArgumentNullException(nameof(JwtOptions.SecretKey), "Secret provided is invalid.");
-            }
-
-            JwtOptions.SecretKey = JwtOptions.SecretKey;
-            services.AddMemoryCache(); // ✅ Registers IMemoryCache in DI
-            services.AddSingleton(typeof(JwtTokenService));
-            Log.Information("Tokens Lifetime configured to {tokenLifeTime}", JwtOptions.TokenLifeTime);
-        }
-
-
         /// <summary>
-        /// Converts a byte array to a hex string.
+        /// Configures rotating JWT authentication services.
         /// </summary>
-        public static string ByteArrayToHexString(this byte[] bytes)
+        /// <param name="services">The service collection.</param>
+        /// <param name="options">A function to configure JWT options.</param>
+        /// <exception cref="ArgumentNullException">Thrown if the SecretKey is null or empty.</exception>
+        public static void AddSecureJwt(this IServiceCollection services, Func<JwtConfiguration, JwtConfiguration> options)
         {
-            var hex = new StringBuilder(bytes.Length * 2);
-            foreach (var b in bytes)
+            JwtOptions = options.Invoke(new JwtConfiguration());
+
+            if (string.IsNullOrEmpty(JwtOptions.Config.SecretKey))
             {
-                hex.AppendFormat("{0:x2}", b);
+                throw new ArgumentNullException(nameof(JwtOptions.Config.SecretKey), "Secret provided is invalid.");
             }
-            return hex.ToString();
+
+            // Register necessary services in the dependency injection container.
+            services.AddMemoryCache(); // ✅ Registers IMemoryCache in DI
+            services.AddHttpContextAccessor(); // ✅ Registers IHttpContextAccessor in DI
+
+            // Register the custom authentication scheme.
+            services.AddAuthentication("SecureJwt")
+                .AddScheme<AuthenticationSchemeOptions, CustomAuthenticationHandler>("SecureJwt", null);
+
+            // Ensure the authentication scheme matches.
+            services.AddAuthorizationBuilder()
+                    // Ensure the authentication scheme matches.
+                    .SetDefaultPolicy(new AuthorizationPolicyBuilder("SecureJwt")
+                    .RequireAuthenticatedUser()
+                    .Build());
+
+            // Register the JWT token service as a singleton.
+            services.AddSingleton<JwtTokenService>();
+
+            // Log the token lifetime configuration.
+            Log.Information("Tokens Lifetime configured to {TokenLifeTime}", JwtOptions.Config.TokenLifeTime);
         }
     }
 }
-
